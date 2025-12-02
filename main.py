@@ -7,8 +7,10 @@ Supports multiple proxies at once
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 import threading
+import socket
+import urllib.request
 import re
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 from proxy_server import ProxyServer, ProxyConfig
 
 
@@ -85,6 +87,10 @@ class ProxySwapApp:
                                         command=self.clear_log)
         self.clear_button.grid(row=0, column=2, padx=5)
 
+        self.check_button = ttk.Button(button_frame, text="Check Proxies",
+                                        command=self.check_proxies)
+        self.check_button.grid(row=0, column=3, padx=5)
+
         # Mapping frame - show all proxy mappings
         mapping_frame = ttk.LabelFrame(main_frame, text="Proxy Mappings (Local → Upstream)", padding="10")
         mapping_frame.grid(row=3, column=0, sticky="nsew", pady=(0, 10))
@@ -132,9 +138,10 @@ class ProxySwapApp:
         log_frame.rowconfigure(0, weight=1)
         main_frame.rowconfigure(4, weight=1)
 
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=8,
-                                                   state="disabled", wrap=tk.WORD)
+        self.log_text = scrolledtext.ScrolledText(log_frame, height=8, wrap=tk.WORD)
         self.log_text.grid(row=0, column=0, sticky="nsew")
+        # Make log read-only but allow copy (Ctrl+C)
+        self.log_text.bind("<Key>", lambda e: self._handle_log_key(e))
 
         # Info label
         info_label = ttk.Label(main_frame,
@@ -142,22 +149,131 @@ class ProxySwapApp:
                                font=("Helvetica", 9), foreground="gray")
         info_label.grid(row=5, column=0)
     
+    def _handle_log_key(self, event):
+        """Handle key events in log - allow copy but block editing"""
+        # Allow Ctrl+C (copy), Ctrl+A (select all)
+        if event.state & 0x4:  # Ctrl key pressed
+            if event.keysym.lower() in ('c', 'a'):
+                return  # Allow these
+        # Allow navigation keys
+        if event.keysym in ('Up', 'Down', 'Left', 'Right', 'Home', 'End', 'Prior', 'Next'):
+            return
+        # Block all other keys (prevent editing)
+        return "break"
+
     def log(self, message: str):
         """Add message to log (thread-safe)"""
         def update():
-            self.log_text.config(state="normal")
             self.log_text.insert(tk.END, f"{message}\n")
             self.log_text.see(tk.END)
-            self.log_text.config(state="disabled")
-        
+
         self.root.after(0, update)
-    
+
     def clear_log(self):
         """Clear the log"""
-        self.log_text.config(state="normal")
         self.log_text.delete(1.0, tk.END)
-        self.log_text.config(state="disabled")
-    
+
+    def check_single_proxy(self, proxy_config: ProxyConfig, proxy_line: str, index: int) -> Tuple[bool, str]:
+        """Check if a single proxy is working"""
+        try:
+            # Create proxy handler with auth
+            proxy_url = f"http://{proxy_config.username}:{proxy_config.password}@{proxy_config.host}:{proxy_config.port}"
+            proxy_handler = urllib.request.ProxyHandler({
+                'http': proxy_url,
+                'https': proxy_url
+            })
+            opener = urllib.request.build_opener(proxy_handler)
+
+            # Test connection to a reliable endpoint
+            request = urllib.request.Request(
+                'http://httpbin.org/ip',
+                headers={'User-Agent': 'Mozilla/5.0'}
+            )
+
+            response = opener.open(request, timeout=10)
+            if response.getcode() == 200:
+                return (True, "OK")
+            else:
+                return (False, f"HTTP {response.getcode()}")
+
+        except urllib.request.URLError as e:
+            return (False, f"URL Error: {str(e.reason)[:30]}")
+        except socket.timeout:
+            return (False, "Timeout")
+        except Exception as e:
+            return (False, str(e)[:30])
+
+    def check_proxies(self):
+        """Check all proxies in the text area"""
+        # Get all proxy lines
+        proxy_text = self.proxy_text.get("1.0", tk.END)
+        proxy_lines = [line.strip() for line in proxy_text.split('\n')
+                       if line.strip() and not line.strip().startswith('#')]
+
+        if not proxy_lines:
+            messagebox.showinfo("Info", "Please enter at least one proxy to check")
+            return
+
+        # Disable button during check
+        self.check_button.config(state="disabled", text="Checking...")
+
+        # Clear previous results in treeview
+        for item in self.mapping_tree.get_children():
+            self.mapping_tree.delete(item)
+
+        self.log(f"Checking {len(proxy_lines)} proxies...")
+
+        # Run check in background thread
+        def check_all():
+            results = []
+            live_count = 0
+            dead_count = 0
+
+            for i, proxy_line in enumerate(proxy_lines):
+                proxy_config = self.parse_proxy_line(proxy_line, show_error=False)
+                if not proxy_config:
+                    results.append((proxy_line, False, "Invalid format"))
+                    dead_count += 1
+                    continue
+
+                is_live, status = self.check_single_proxy(proxy_config, proxy_line, i)
+                results.append((proxy_line, is_live, status))
+
+                if is_live:
+                    live_count += 1
+                    self.log(f"✓ LIVE: {proxy_config.host}:{proxy_config.port}")
+                else:
+                    dead_count += 1
+                    self.log(f"✗ DEAD: {proxy_config.host}:{proxy_config.port} - {status}")
+
+            # Update UI on main thread
+            def update_ui():
+                for proxy_line, is_live, status in results:
+                    proxy_config = self.parse_proxy_line(proxy_line, show_error=False)
+                    if proxy_config:
+                        upstream = f"{proxy_config.host}:{proxy_config.port}"
+                    else:
+                        upstream = proxy_line[:40]
+
+                    status_text = "✓ LIVE" if is_live else f"✗ {status}"
+                    self.mapping_tree.insert("", "end", values=(
+                        "-",
+                        upstream,
+                        status_text
+                    ))
+
+                self.log(f"Check complete: {live_count} live, {dead_count} dead")
+                self.status_label.config(
+                    text=f"Check Result: {live_count} live, {dead_count} dead",
+                    foreground="green" if live_count > 0 else "red"
+                )
+                self.check_button.config(state="normal", text="Check Proxies")
+
+            self.root.after(0, update_ui)
+
+        thread = threading.Thread(target=check_all, daemon=True)
+        thread.start()
+
     def parse_proxy_line(self, proxy_str: str, show_error: bool = True) -> Optional[ProxyConfig]:
         """Parse proxy string in format ip:port:user:pass"""
         proxy_str = proxy_str.strip()

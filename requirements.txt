@@ -1,6 +1,9 @@
 # Proxy Swap Tool Dependencies
 # Note: tkinter is included with Python standard library
 
+# Core proxy library - handles HTTP/HTTPS proxy with upstream authentication
+proxy.py>=2.4.0
+
 # For building executable
 pyinstaller>=6.0.0
 
