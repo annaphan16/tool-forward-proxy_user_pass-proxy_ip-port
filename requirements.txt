@@ -1,0 +1,6 @@
+# Proxy Swap Tool Dependencies
+# Note: tkinter is included with Python standard library
+
+# For building executable
+pyinstaller>=6.0.0
+
